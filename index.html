@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Chords Transposer</title>
+<style>
+  body {
+    font-family: Arial, sans-serif;
+    background: #fafafa;
+    color: #222;
+    margin: 18px;
+  }
+  h1 { text-align:center; color:#008b8b; margin-bottom:10px; }
+  textarea {
+    width:100%;
+    height:180px;
+    padding:10px;
+    box-sizing:border-box;
+    font-family: monospace;
+    font-size:15px;
+    border-radius:8px;
+    border:1px solid #ccc;
+    resize:vertical;
+  }
+  .controls {
+    display:flex;
+    flex-wrap:wrap;
+    gap:8px;
+    align-items:center;
+    margin-top:12px;
+  }
+  select, input[type=number], button {
+    padding:8px 10px;
+    border-radius:8px;
+    border:1px solid #bbb;
+    font-size:14px;
+    background:#fff;
+  }
+  button {
+    cursor:pointer;
+    background:#00b8a9;
+    color:white;
+    border:none;
+    font-weight:600;
+  }
+  button.ghost {
+    background:#f1f5f5; color:#007f7f; border:1px solid #cfecec;
+  }
+  #outputPreview {
+    margin-top:14px;
+    padding:12px;
+    border-radius:8px;
+    border:1px dashed #bfeeee;
+    background:#f0fbfb;
+    white-space:pre-wrap;
+    font-family:monospace;
+    min-height:120px;
+  }
+  .chord { color:#00b8a9; font-weight:700; }
+  .notation-toggle {
+    display:flex; align-items:center; gap:6px;
+    background:#eee; padding:6px; border-radius:20px;
+  }
+  .notation-toggle span { padding:6px 8px; border-radius:50%; cursor:pointer; }
+  .notation-toggle .active { background:#00b8a9; color:#fff; }
+  .small-note { font-size:12px; color:#666; margin-left:6px; }
+  @media (max-width:600px) {
+    .controls { flex-direction:column; align-items:stretch; }
+    select, input[type=number], button { width:100%; }
+  }
+</style>
+</head>
+<body>
+  <h1>🎵 Chords Transposer</h1>
+
+  <textarea id="inputArea" placeholder="Paste your chords & lyrics here (supports bracketed/inline chords and slash bass chords)."></textarea>
+
+  <div class="controls">
+    <label>Original Key:</label>
+    <select id="originalKey"></select>
+
+    <label>Transposed Key:</label>
+    <select id="transposedKey"></select>
+
+    <!-- compact sharp/flat toggle -->
+    <div class="notation-toggle" id="notationToggle" title="Display sharps or flats">
+      <span id="sharpToggle" class="active">♯</span>
+      <span id="flatToggle">♭</span>
+    </div>
+
+    <button id="detectKeyBtn" class="ghost">Detect Key</button>
+    <button id="transposeBtn">Transpose</button>
+
+    <button id="minusBtn" class="ghost">−</button>
+    <input type="number" id="semitoneInput" value="0" style="width:80px; text-align:center;">
+    <button id="plusBtn" class="ghost">+</button>
+  </div>
+
+  <div id="outputPreview" aria-live="polite"></div>
+
+<script>
+/* -------------------------
+   Data & mappings
+   ------------------------- */
+// canonical representation for semitones (0..11)
+const NOTES_SHARP = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+const NOTES_FLAT  = ['C','Db','D','Eb','E','F','Gb','G','Ab','A','Bb','B'];
+
+// map many names to 0..11
+const NOTE_TO_VALUE = {
+  'C':0,'B#':0,
+  'C#':1,'Db':1,
+  'D':2,
+  'D#':3,'Eb':3,
+  'E':4,'Fb':4,
+  'F':5,'E#':5,
+  'F#':6,'Gb':6,
+  'G':7,
+  'G#':8,'Ab':8,
+  'A':9,
+  'A#':10,'Bb':10,
+  'B':11,'Cb':11
+};
+
+// list of labels to populate dropdowns (mix of sharps & flats for convenience)
+const DROPDOWN_KEYS = ['C','C#','Db','D','D#','Eb','E','F','F#','Gb','G','G#','Ab','A','A#','Bb','B'];
+
+/* -------------------------
+   DOM elements
+   ------------------------- */
+const inputArea = document.getElementById('inputArea');
+const originalKeySelect = document.getElementById('originalKey');
+const transposedKeySelect = document.getElementById('transposedKey');
+const semitoneInput = document.getElementById('semitoneInput');
+const plusBtn = document.getElementById('plusBtn');
+const minusBtn = document.getElementById('minusBtn');
+const transposeBtn = document.getElementById('transposeBtn');
+const detectKeyBtn = document.getElementById('detectKeyBtn');
+const outputPreview = document.getElementById('outputPreview');
+const sharpToggle = document.getElementById('sharpToggle');
+const flatToggle = document.getElementById('flatToggle');
+
+let useFlats = false;      // notation preference
+let semitoneShift = 0;     // current numeric shift (0..11)
+
+/* -------------------------
+   Initialize dropdowns
+   ------------------------- */
+function populateKeyDropdowns() {
+  originalKeySelect.innerHTML = '';
+  transposedKeySelect.innerHTML = '';
+  DROPDOWN_KEYS.forEach(k => {
+    const o1 = document.createElement('option'); o1.value = k; o1.textContent = k;
+    const o2 = document.createElement('option'); o2.value = k; o2.textContent = k;
+    originalKeySelect.appendChild(o1);
+    transposedKeySelect.appendChild(o2);
+  });
+  originalKeySelect.value = 'C';
+  transposedKeySelect.value = 'C';
+}
+populateKeyDropdowns();
+
+/* -------------------------
+   Utility helpers
+   ------------------------- */
+function noteValue(note) {
+  // Normalise note like 'Db' or 'C#' to 0..11. Return undefined if unknown.
+  return NOTE_TO_VALUE[note];
+}
+function noteNameFromValue(v, preferFlats) {
+  v = ((v % 12) + 12) % 12;
+  return preferFlats ? NOTES_FLAT[v] : NOTES_SHARP[v];
+}
+
+/* Parse chord token and return components:
+   { root, suffix, bass }   where bass is optional root like 'G' in 'C/G'
+*/
+function parseChordToken(token) {
+  // token examples: C, C#m7, Ebmaj7/Gb
+  const m = token.match(/^([A-G][#b]?)([^\/\s]*)?(?:\/([A-G][#b]?))?$/);
+  if (!m) return null;
+  return { root: m[1], suffix: m[2] || '', bass: m[3] || null };
+}
+
+/* Transpose single chord string (handles suffix and bass) */
+function transposeChord(chordStr, shift, preferFlats) {
+  const parsed = parseChordToken(chordStr);
+  if (!parsed) return chordStr; // not a chord
+  const { root, suffix, bass } = parsed;
+  const rootVal = noteValue(root);
+  if (rootVal === undefined) return chordStr; // unknown root (e.g., lyric)
+  const newRoot = noteNameFromValue(rootVal + shift, preferFlats);
+  let out = newRoot + suffix;
+  if (bass) {
+    const bassVal = noteValue(bass);
+    const newBass = (bassVal === undefined) ? bass : noteNameFromValue(bassVal + shift, preferFlats);
+    out += '/' + newBass;
+  }
+  return out;
+}
+
+/* Regex scan for chord-like occurrences in a line:
+   matches bracketed chords or standalone chord tokens.
+   returns array of {index, length, token, openBracket, closeBracket}
+*/
+function findChordMatches(line) {
+  const re = /([\(\[\{])?([A-G][#b]?[^ \n\t,()\[\]{}\/]*?(?:\/[A-G][#b]?)?)([\)\]\}])?/g;
+  const out = [];
+  let m;
+  while ((m = re.exec(line)) !== null) {
+    const raw = m[0];
+    const openB = m[1] || '';
+    const token = m[2];
+    const closeB = m[3] || '';
+    // validate token is chord-like
+    const parsed = parseChordToken(token);
+    if (parsed) {
+      out.push({ index: m.index, length: raw.length, openB, token, closeB });
+    }
+    // avoid zero-length match loop
+    if (m.index === re.lastIndex) re.lastIndex++;
+  }
+  return out;
+}
+
+/* Decide if a line is mostly chords (>=60% chord tokens) */
+function likelyChordLine(line) {
+  const words = line.trim().split(/\s+/).filter(Boolean);
+  if (words.length === 0) return false;
+  let chordCount = 0;
+  for (const w of words) {
+    const tok = w.replace(/^[\(\[\{]+|[\)\]\}]+$/g, '');
+    if (parseChordToken(tok)) chordCount++;
+  }
+  return (chordCount / words.length) >= 0.6;
+}
+
+/* Build the transposed preview HTML and plain text (plain used for copying if needed) */
+function buildTransposedPreview(text, shift) {
+  const preferFlats = useFlats;
+  const lines = text.split('\n');
+  const resultLines = lines.map(line => {
+    const hasBracket = /[\(\[\{].*?[\)\]\}]/.test(line);
+    if (!likelyChordLine(line) && !hasBracket) {
+      return { plain: line, html: `<span>${escapeHtml(line)}</span>` };
+    }
+    // process matches and replace tokens
+    let cursor = 0;
+    let plain = '';
+    let html = '';
+    const matches = findChordMatches(line);
+    if (matches.length === 0) {
+      // fallback - return line as-is
+      return { plain: line, html: `<span>${escapeHtml(line)}</span>` };
+    }
+    for (const m of matches) {
+      if (m.index > cursor) {
+        const before = line.slice(cursor, m.index);
+        plain += before;
+        html += `<span>${escapeHtml(before)}</span>`;
+      }
+      const open = m.openB || '';
+      const close = m.closeB || '';
+      const transposed = transposeChord(m.token, shift, preferFlats);
+      plain += open + transposed + close;
+      html += escapeHtml(open) + `<span class="chord">${escapeHtml(transposed)}</span>` + escapeHtml(close);
+      cursor = m.index + m.length;
+    }
+    if (cursor < line.length) {
+      const rest = line.slice(cursor);
+      plain += rest;
+      html += `<span>${escapeHtml(rest)}</span>`;
+    }
+    return { plain, html };
+  });
+  return {
+    plain: resultLines.map(r => r.plain).join('\n'),
+    html: resultLines.map(r => r.html).join('\n')
+  };
+}
+
+/* escape HTML */
+function escapeHtml(s){
+  return (s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+/* -------------------------
+   Key detection (improved)
+   - collects only root tokens from chord-like lines & bracketed chords
+   - counts root names mapped to semitone values
+   - returns suggestion in current notation (sharp/flat)
+*/
+function detectKeySuggestion(text) {
+  const tokens = [];
+  const lines = text.split('\n');
+  for (const line of lines) {
+    if (likelyChordLine(line) || /[\(\[\{].*?[\)\]\}]/.test(line)) {
+      // capture all roots (including bracketed)
+      const re = /([A-G][#b]?)(?=[\s\/\]\)\},]|$)/g;
+      let m;
+      while ((m = re.exec(line)) !== null) {
+        const root = m[1];
+        if (noteValue(root) !== undefined) tokens.push(root);
+        if (m.index === re.lastIndex) re.lastIndex++;
+      }
+    }
+  }
+  if (tokens.length === 0) return null;
+  // count semitone frequency
+  const counts = {};
+  tokens.forEach(t => {
+    const v = noteValue(t);
+    counts[v] = (counts[v] || 0) + 1;
+  });
+  // pick most frequent semitone value
+  let best = null, max = -1;
+  for (const k in counts) {
+    if (counts[k] > max) { max = counts[k]; best = parseInt(k); }
+  }
+  if (best === null) return null;
+  return noteNameFromValue(best, useFlats);
+}
+
+/* -------------------------
+   Synchronization helpers
+   ------------------------- */
+/* Update semitoneInput when a transposed or original key is chosen,
+   but do NOT auto-transpose (user requested transpose-on-click).
+*/
+function syncSemitoneFromKeys() {
+  const from = originalKeySelect.value;
+  const to = transposedKeySelect.value;
+  const fromVal = noteValue(from);
+  const toVal = noteValue(to);
+  if (fromVal === undefined || toVal === undefined) return;
+  semitoneShift = (toVal - fromVal + 12) % 12;
+  semitoneInput.value = semitoneShift;
+}
+
+/* Update transposedKeySelect based on semitoneInput and originalKey */
+function syncTransposedFromSemitone() {
+  const from = originalKeySelect.value;
+  const fromVal = noteValue(from);
+  const v = parseInt(semitoneInput.value);
+  if (fromVal === undefined || isNaN(v)) return;
+  const newVal = (fromVal + v + 12) % 12;
+  const name = noteNameFromValue(newVal, useFlats);
+  // If dropdown has this exact value, set; else pick a visually close value
+  // Try direct match
+  if ([...transposedKeySelect.options].some(o => o.value === name)) {
+    transposedKeySelect.value = name;
+  } else {
+    // fallback: pick any option whose semitone matches
+    for (const opt of transposedKeySelect.options) {
+      if (noteValue(opt.value) === newVal) { transposedKeySelect.value = opt.value; break; }
+    }
+  }
+}
+
+/* -------------------------
+   Actions
+   ------------------------- */
+function performTranspose() {
+  // compute semitoneShift from dropdowns to ensure sync
+  const fromVal = noteValue(originalKeySelect.value);
+  const toVal = noteValue(transposedKeySelect.value);
+  if (fromVal === undefined || toVal === undefined) return;
+  semitoneShift = (toVal - fromVal + 12) % 12;
+  semitoneInput.value = semitoneShift;
+  const text = inputArea.value || '';
+  const res = buildTransposedPreview(text, semitoneShift);
+  outputPreview.innerHTML = res.html || '';
+  // store plain text in data attribute (useful for copy later)
+  outputPreview.dataset.plain = res.plain;
+}
+
+/* Detect key button (no blocking alert) */
+function onDetectKeyClick() {
+  const suggested = detectKeySuggestion(inputArea.value || '');
+  if (suggested) {
+    originalKeySelect.value = suggested;
+    // brief non-blocking feedback: change button text then revert
+    const prev = detectKeyBtn.textContent;
+    detectKeyBtn.textContent = `Detected: ${suggested}`;
+    setTimeout(()=> detectKeyBtn.textContent = prev, 1500);
+  } else {
+    const prev = detectKeyBtn.textContent;
+    detectKeyBtn.textContent = 'No key';
+    setTimeout(()=> detectKeyBtn.textContent = prev, 1200);
+  }
+}
+
+/* -------------------------
+   Event wiring
+   ------------------------- */
+detectKeyBtn.addEventListener('click', onDetectKeyClick);
+
+// notation toggle
+sharpToggle.addEventListener('click', ()=>{
+  useFlats = false;
+  sharpToggle.classList.add('active');
+  flatToggle.classList.remove('active');
+  // update displayed transposed key name (but do not auto-transpose)
+  syncTransposedFromSemitone();
+});
+flatToggle.addEventListener('click', ()=>{
+  useFlats = true;
+  flatToggle.classList.add('active');
+  sharpToggle.classList.remove('active');
+  syncTransposedFromSemitone();
+});
+
+// when user changes transposed key dropdown: update semitone numeric to reflect it, but do not auto-transpose
+transposedKeySelect.addEventListener('change', ()=> {
+  syncSemitoneFromKeys();
+  // do NOT call performTranspose() — per your request transpose happens only on clicking the button
+});
+
+// when user changes original key: update semitone numeric and adjust transposed key to match current semitone
+originalKeySelect.addEventListener('change', () => {
+  syncSemitoneFromKeys();
+  // but also reflect semitone as transposedKey (if semitoneInput present)
+  syncTransposedFromSemitone();
+});
+
+// when the semitone numeric input changes: update transposed key to reflect it (but do not auto-transpose)
+semitoneInput.addEventListener('change', () => {
+  // clamp and normalize
+  const v = parseInt(semitoneInput.value);
+  semitoneShift = isNaN(v) ? 0 : ((v%12)+12)%12;
+  semitoneInput.value = semitoneShift;
+  syncTransposedFromSemitone();
+});
+
+// when user clicks plus/minus, update semitone numeric and transposedKey but do not auto-transpose
+plusBtn.addEventListener('click', () => {
+  semitoneShift = ((parseInt(semitoneInput.value)||0) + 1) % 12;
+  semitoneInput.value = semitoneShift;
+  syncTransposedFromSemitone();
+});
+minusBtn.addEventListener('click', () => {
+  semitoneShift = ((parseInt(semitoneInput.value)||0) - 1 + 12) % 12;
+  semitoneInput.value = semitoneShift;
+  syncTransposedFromSemitone();
+});
+
+// transpose button triggers the actual transposition preview
+transposeBtn.addEventListener('click', performTranspose);
+
+// keep preview up-to-date when user types but do not auto-transpose; we can show a quick live detection hint if wanted
+inputArea.addEventListener('input', () => {
+  // if there's already an output shown for current semitone shift, reflect changes live in preview
+  // (but only if a transpose was already performed with the current semitoneShift)
+  if (outputPreview.dataset.plain) {
+    const res = buildTransposedPreview(inputArea.value || '', semitoneShift);
+    outputPreview.innerHTML = res.html;
+    outputPreview.dataset.plain = res.plain;
+  }
+});
+
+/* initialize */
+syncTransposedFromSemitone();
+</script>
+</body>
+</html>
